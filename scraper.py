@@ -81,42 +81,107 @@ def is_hanzi(text):
 
 
 # =========================================================
-# CHECK VOCAB START
-#
-# Ví dụ:
-#
-# 01
-# 不
-#
-# 02
-# 好
-#
-# 10
-# 学生
-#
-# Chỉ những số này mới là STT từ.
+# CHECK HANZI
 # =========================================================
 
+# Hỗ trợ toàn bộ chuỗi Hanzi, không giới hạn 1/2 ký tự.
+# Bao gồm CJK Unified Ideographs và Extension A.
+HANZI_RE = re.compile(r"^[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]+$")
+
+
+def is_hanzi(text):
+    if not text:
+        return False
+
+    text = text.strip()
+
+    return bool(HANZI_RE.fullmatch(text))
+
+
+# =========================================================
+# CHECK VOCAB START
+# =========================================================
+
+# HanBeeGo đánh số từ 01, 02,... nhưng không nên phụ thuộc
+# cứng vào đúng 2 chữ số. Hỗ trợ 1-3 chữ số để dùng được
+# cho mọi bài/HSK và không làm mất các từ có Hanzi dài.
+VOCAB_NUMBER_RE = re.compile(r"^\d{1,3}$")
+
+
+def find_pos_index(lines, start_index, max_scan=12):
+    """
+    Tìm vị trí từ loại ngay sau Hanzi + Pinyin.
+
+    Không giả định Pinyin có bao nhiêu âm tiết:
+        bù
+        lǎo
+        shī
+        lǎo shī
+        zài jiàn
+        xué sheng
+    đều được hỗ trợ.
+    """
+
+    end = min(
+        len(lines),
+        start_index + max_scan
+    )
+
+    for i in range(start_index, end):
+        if lines[i].strip() in POS_LIST:
+            return i
+
+    return None
+
+
 def is_vocab_start(lines, index):
+    """
+    Một entry vocabulary hợp lệ phải có:
+
+        STT
+        Hanzi
+        Pinyin (1 hoặc nhiều dòng)
+        Từ loại
+
+    Nhờ kiểm tra cả Từ loại, các số 01/02 xuất hiện
+    trong nội dung khác sẽ không bị nhận nhầm thành từ mới.
+    """
 
     if index >= len(lines):
         return False
 
-    current = lines[index].strip()
-
-    if not re.fullmatch(
-        r"\d{2}",
-        current
+    if not VOCAB_NUMBER_RE.fullmatch(
+        lines[index].strip()
     ):
         return False
 
-    # Phải có Hanzi ngay phía sau
     if index + 1 >= len(lines):
         return False
 
-    return is_hanzi(
-        lines[index + 1]
+    if not is_hanzi(lines[index + 1]):
+        return False
+
+    pos_index = find_pos_index(
+        lines,
+        index + 2
     )
+
+    return pos_index is not None
+
+
+# =========================================================
+# CLEAN TEXT
+# =========================================================
+
+def clean_text(text):
+    if text is None:
+        return ""
+
+    return re.sub(
+        r"\s+",
+        " ",
+        str(text)
+    ).strip()
 
 
 # =========================================================
@@ -124,47 +189,79 @@ def is_vocab_start(lines, index):
 # =========================================================
 
 def clean_meaning(parts):
+    """
+    Giữ nguyên cấu trúc nhiều nghĩa:
+
+        1
+        .
+        nghĩa A
+        2
+        .
+        nghĩa B
+        ghi chú B
+
+    => 1. nghĩa A; 2. nghĩa B ghi chú B
+
+    Nếu không có đánh số:
+        nghĩa chính
+        mô tả
+
+    => nghĩa chính mô tả
+    """
 
     if not parts:
         return ""
 
-    result = []
+    groups = []
+    current = []
+    current_number = None
 
-    for part in parts:
+    for raw in parts:
 
-        part = part.strip()
+        line = clean_text(raw)
 
-        if not part:
+        if not line:
             continue
 
-        # Bỏ dấu *
-        if part == "*":
+        if line == "*":
             continue
 
-        # Bỏ số thứ tự nghĩa
-        if re.fullmatch(
-            r"\d+",
-            part
-        ):
+        # Bỏ dấu chấm đứng riêng sau số nghĩa.
+        if line in [".", "．"]:
             continue
 
-        # Bỏ dấu chấm đứng riêng
-        if part in [".", "．"]:
+        # Một số nguồn có "1", "2",...
+        # đứng riêng để đánh số các nghĩa.
+        if re.fullmatch(r"\d+", line):
+
+            if current:
+                text = " ".join(current).strip()
+
+                if current_number is not None:
+                    text = f"{current_number}. {text}"
+
+                groups.append(text)
+
+            current = []
+            current_number = line
+
             continue
 
-        result.append(part)
+        current.append(line)
 
-    # Ghép lại
-    text = " ".join(result)
+    # Lưu nhóm cuối.
+    if current:
 
-    # Xử lý khoảng trắng
-    text = re.sub(
-        r"\s+",
-        " ",
-        text
-    ).strip()
+        text = " ".join(current).strip()
 
-    return text
+        if current_number is not None:
+            text = f"{current_number}. {text}"
+
+        groups.append(text)
+
+    return "; ".join(
+        group for group in groups if group
+    )
 
 
 # =========================================================
@@ -173,53 +270,35 @@ def clean_meaning(parts):
 
 def parse_vocab_block(block):
 
-    if len(block) < 3:
+    if len(block) < 4:
         return None
 
     # -----------------------------------------------------
     # STT
     # -----------------------------------------------------
 
-    stt = block[0]
+    stt = block[0].strip()
+
+    if not VOCAB_NUMBER_RE.fullmatch(stt):
+        return None
 
     # -----------------------------------------------------
     # HANZI
     # -----------------------------------------------------
 
-    hanzi = block[1]
+    hanzi = block[1].strip()
 
     if not is_hanzi(hanzi):
         return None
 
     # -----------------------------------------------------
     # TÌM TỪ LOẠI
-    #
-    # Ví dụ:
-    #
-    # 不
-    # bù
-    # Trạng từ
-    #
-    # hoặc:
-    #
-    # 老师
-    # lǎo
-    # shī
-    # Danh từ
     # -----------------------------------------------------
 
-    pos_index = None
-
-    for i in range(
-        2,
-        len(block)
-    ):
-
-        if block[i] in POS_LIST:
-
-            pos_index = i
-
-            break
+    pos_index = find_pos_index(
+        block,
+        2
+    )
 
     if pos_index is None:
         return None
@@ -227,131 +306,49 @@ def parse_vocab_block(block):
     # -----------------------------------------------------
     # PINYIN
     #
-    # Tất cả những dòng giữa Hanzi và Từ loại
+    # Lấy toàn bộ nội dung giữa Hanzi và Từ loại.
+    # Không giới hạn số âm tiết.
     #
-    # 老师
-    # lǎo
-    # shī
-    # Danh từ
-    #
-    # => lǎo shī
+    # Ví dụ:
+    #   bù
+    #   lǎo shī
+    #   zài jiàn
+    #   xué sheng
     # -----------------------------------------------------
 
-    pinyin_parts = block[
-        2:pos_index
-    ]
-
     pinyin_parts = [
-        x.strip()
-        for x in pinyin_parts
-        if x.strip()
+        clean_text(x)
+        for x in block[2:pos_index]
+        if clean_text(x)
     ]
 
-    pinyin = " ".join(
-        pinyin_parts
-    )
+    pinyin = " ".join(pinyin_parts)
 
     # -----------------------------------------------------
     # TỪ LOẠI
     # -----------------------------------------------------
 
-    pos = block[
-        pos_index
-    ].strip()
+    pos = clean_text(
+        block[pos_index]
+    )
 
     # -----------------------------------------------------
     # NGHĨA
-    #
-    # Lấy từ sau Từ loại
-    # đến trước "Ví dụ"
     # -----------------------------------------------------
 
-# -----------------------------------------------------
-# NGHĨA
-# -----------------------------------------------------
-
-    meaning_parts = []
-
-    meaning_number = None
+    meaning_lines = []
 
     for line in block[pos_index + 1:]:
 
         line = line.strip()
 
-        # ---------------------------------------------
-        # Gặp Ví dụ => hết phần nghĩa
-        # ---------------------------------------------
-
         if line == "Ví dụ":
             break
 
-        # ---------------------------------------------
-        # Bỏ dấu *
-        # ---------------------------------------------
+        meaning_lines.append(line)
 
-        if line == "*":
-            continue
-
-        # ---------------------------------------------
-        # Số thứ tự nghĩa
-        #
-        # 1
-        # .
-        # nghĩa 1
-        #
-        # => 1. nghĩa 1
-        # ---------------------------------------------
-
-        if re.fullmatch(r"\d+", line):
-
-            meaning_number = line
-
-            continue
-
-        # ---------------------------------------------
-        # Dấu . đứng sau số
-        # ---------------------------------------------
-
-        if line in [".", "．"]:
-
-            continue
-
-        # ---------------------------------------------
-        # Nếu đang có số nghĩa
-        # ---------------------------------------------
-
-        if meaning_number is not None:
-
-            meaning_parts.append(
-                f"{meaning_number}. {line}"
-            )
-
-            meaning_number = None
-
-        else:
-
-            meaning_parts.append(
-                line
-            )
-
-
-    # -----------------------------------------------------
-    # GHÉP NGHĨA
-    # -----------------------------------------------------
-
-    meaning = "; ".join(
-        meaning_parts
-    )
-
-    meaning = re.sub(
-        r"\s+",
-        " ",
-        meaning
-    ).strip()
-
-    # Không để ; dư ở cuối
-    meaning = meaning.strip(
-        " ;"
+    meaning = clean_meaning(
+        meaning_lines
     )
 
     return {
@@ -360,6 +357,46 @@ def parse_vocab_block(block):
         "Từ loại": pos,
         "Nghĩa": meaning
     }
+
+
+# =========================================================
+# FIND VOCABULARY SECTION
+# =========================================================
+
+def find_vocab_start(lines):
+    """
+    Tìm entry vocabulary đầu tiên sau tiêu đề 'Từ vựng'.
+
+    Không phụ thuộc bài có bao nhiêu từ.
+    """
+
+    vocab_headers = {
+        "Từ vựng",
+        "Vocabulary"
+    }
+
+    for i, line in enumerate(lines):
+
+        if line not in vocab_headers:
+            continue
+
+        # Tìm candidate đầu tiên có cấu trúc đầy đủ.
+        for j in range(i + 1, len(lines)):
+
+            if is_vocab_start(lines, j):
+                return j
+
+            # Nếu đã sang phần khác thì dừng.
+            if lines[j] in {
+                "Ngữ pháp",
+                "Grammar",
+                "Hội thoại",
+                "Dialogues",
+                "Bài tập"
+            }:
+                break
+
+    return None
 
 
 # =========================================================
@@ -380,62 +417,37 @@ def scrape_vocab(url):
     )
 
     lines = [
-        line.strip()
+        clean_text(line)
         for line in text.splitlines()
-        if line.strip()
+        if clean_text(line)
     ]
 
     # -----------------------------------------------------
     # Tìm phần Từ vựng
     # -----------------------------------------------------
 
-    start = None
-
-    for i, line in enumerate(lines):
-
-        if line == "Từ vựng":
-
-            # Tìm STT đầu tiên: 01
-            for j in range(
-                i + 1,
-                len(lines)
-            ):
-
-                if (
-                    lines[j] == "01"
-                    and j + 1 < len(lines)
-                    and is_hanzi(lines[j + 1])
-                ):
-
-                    start = j
-                    break
-
-            if start is not None:
-                break
+    start = find_vocab_start(lines)
 
     if start is None:
-
         raise Exception(
             "Không tìm thấy danh sách từ vựng."
         )
 
     # -----------------------------------------------------
-    # Tìm tất cả vị trí bắt đầu của từ
+    # Tìm tất cả entry vocabulary
     # -----------------------------------------------------
 
     vocab_positions = []
 
-    for i in range(
-        start,
-        len(lines)
-    ):
+    for i in range(start, len(lines)):
 
-        if is_vocab_start(
-            lines,
-            i
-        ):
-
+        if is_vocab_start(lines, i):
             vocab_positions.append(i)
+
+    if not vocab_positions:
+        raise Exception(
+            "Không tìm thấy từ vựng hợp lệ."
+        )
 
     # -----------------------------------------------------
     # Tạo block
@@ -443,41 +455,35 @@ def scrape_vocab(url):
 
     blocks = []
 
-    for index, position in enumerate(
-        vocab_positions
-    ):
+    for index, position in enumerate(vocab_positions):
 
-        # Điểm kết thúc
-        if index + 1 < len(
-            vocab_positions
-        ):
+        if index + 1 < len(vocab_positions):
 
-            end = vocab_positions[
-                index + 1
-            ]
+            end = vocab_positions[index + 1]
 
         else:
 
             end = len(lines)
 
-            # Không cần lấy quá phần vocabulary
-            for j in range(
-                position,
-                len(lines)
-            ):
+            # Dừng trước phần tiếp theo.
+            section_headers = {
+                "Ngữ pháp",
+                "Grammar",
+                "Hội thoại",
+                "Dialogues",
+                "Bài tập",
+                "Exercises"
+            }
 
-                if lines[j] == "Ngữ pháp":
+            for j in range(position, len(lines)):
 
+                if lines[j] in section_headers:
                     end = j
                     break
 
-        block = lines[
-            position:end
-        ]
+        block = lines[position:end]
 
-        blocks.append(
-            block
-        )
+        blocks.append(block)
 
     # -----------------------------------------------------
     # Parse từng block
@@ -487,22 +493,16 @@ def scrape_vocab(url):
 
     for block in blocks:
 
-        item = parse_vocab_block(
-            block
-        )
+        item = parse_vocab_block(block)
 
         if item:
-
-            results.append(
-                item
-            )
+            results.append(item)
 
     # -----------------------------------------------------
     # Chống duplicate trong lần cào
     # -----------------------------------------------------
 
     unique = []
-
     seen = set()
 
     for item in results:
@@ -516,7 +516,6 @@ def scrape_vocab(url):
             continue
 
         seen.add(key)
-
         unique.append(item)
 
     return unique
