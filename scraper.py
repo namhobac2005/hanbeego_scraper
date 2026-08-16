@@ -1,8 +1,8 @@
 import requests
 import pandas as pd
-from bs4 import BeautifulSoup
 import re
 import os
+import json
 
 
 # =========================================================
@@ -24,29 +24,32 @@ HEADERS = {
 # TỪ LOẠI
 # =========================================================
 
-POS_LIST = [
-    "Danh từ",
-    "Động từ",
-    "Tính từ",
-    "Đại từ",
-    "Trạng từ",
-    "Trợ từ",
-    "Lượng từ",
-    "Liên từ",
-    "Thán từ",
-    "Giới từ",
-    "Phó từ",
-    "Số từ",
-    "Định từ",
-]
+POS_MAP = {
+    "noun": "Danh từ",
+    "verb": "Động từ",
+    "adjective": "Tính từ",
+    "pronoun": "Đại từ",
+    "adverb": "Trạng từ",
+    "particle": "Trợ từ",
+    "measure_word": "Lượng từ",
+    "classifier": "Lượng từ",
+    "conjunction": "Liên từ",
+    "interjection": "Thán từ",
+    "preposition": "Giới từ",
+    "numeral": "Số từ",
+    "determiner": "Định từ",
+    "phrase": "Cụm từ",
+    "greeting": "Chào hỏi",
+    "auxiliary": "Trợ động từ",
+    "adverbial": "Trạng từ",
+}
 
 
 # =========================================================
-# GET PAGE
+# REQUEST
 # =========================================================
 
 def get_page(url):
-
     response = requests.get(
         url,
         headers=HEADERS,
@@ -55,300 +58,486 @@ def get_page(url):
 
     response.raise_for_status()
 
-    return BeautifulSoup(
-        response.text,
-        "html.parser"
-    )
+    return response.text
 
 
 # =========================================================
-# CHECK HANZI
+# HELPERS
 # =========================================================
 
-def is_hanzi(text):
+def clean_text(value):
+    if value is None:
+        return ""
 
-    if not text:
+    value = str(value)
+
+    value = re.sub(
+        r"\s+",
+        " ",
+        value
+    ).strip()
+
+    return value
+
+
+def is_hanzi(value):
+    if not value:
         return False
 
-    text = text.strip()
+    value = str(value).strip()
 
     return bool(
         re.fullmatch(
             r"[\u3400-\u4DBF\u4E00-\u9FFF]+",
-            text
+            value
+        )
+    )
+
+
+def normalize_rsc(text):
+    """
+    Next.js RSC có thể escape JSON nhiều lớp.
+    Chuẩn hóa các kiểu phổ biến:
+
+        \\"  -> "
+        \\u0022 -> "
+        \\/ -> /
+        \\\\ -> \\
+
+    Không parse toàn bộ HTML thành JSON vì RSC không phải
+    một JSON document duy nhất.
+    """
+
+    result = text
+
+    # Decode Unicode quote escape trước.
+    result = result.replace(
+        "\\u0022",
+        '"'
+    )
+
+    result = result.replace(
+        "\\u0027",
+        "'"
+    )
+
+    # Có thể có nhiều lớp escape.
+    for _ in range(4):
+        new_result = result.replace(
+            '\\"',
+            '"'
+        )
+
+        if new_result == result:
+            break
+
+        result = new_result
+
+    return result
+
+
+# =========================================================
+# FIND VOCAB OBJECTS DIRECTLY
+#
+# KHÔNG còn phụ thuộc vào:
+#
+#     "vocabs":[...]
+#
+# vì Next.js RSC có thể chia/escape dữ liệu khiến việc tìm
+# nguyên array thất bại.
+#
+# Thay vào đó tìm trực tiếp từng object có:
+#
+#     id = v_HSKx_xxxx
+#     hanzi
+#     pinyin
+#     partOfSpeech
+#     meanings
+#
+# Đây vẫn đúng flow:
+#
+# HTML
+#   ↓
+# Next.js embedded data
+#   ↓
+# vocabulary object
+#   ↓
+# id / hanzi / pinyin / partOfSpeech / meanings
+#   ↓
+# DataFrame
+# =========================================================
+
+def extract_vocab_objects(html):
+
+    text = normalize_rsc(html)
+
+    results = []
+
+    # -----------------------------------------------------
+    # Pattern chính.
+    #
+    # Không giới hạn độ dài Hanzi/Pinyin.
+    # -----------------------------------------------------
+
+    pattern = re.compile(
+        r'"id"\s*:\s*"(?P<id>v_HSK\d+_\d+)"'
+        r'.{0,5000}?'
+        r'"hanzi"\s*:\s*"(?P<hanzi>.*?)"'
+        r'.{0,1000}?'
+        r'"pinyin"\s*:\s*"(?P<pinyin>.*?)"'
+        r'.{0,3000}?'
+        r'"partOfSpeech"\s*:\s*\[(?P<pos>.*?)\]'
+        r'.{0,3000}?'
+        r'"meanings"\s*:\s*(?P<meanings>\[)',
+        re.DOTALL
+    )
+
+    for match in pattern.finditer(text):
+
+        item_id = match.group("id")
+        hanzi = clean_text(
+            match.group("hanzi")
+        )
+        pinyin = clean_text(
+            match.group("pinyin")
+        )
+
+        if not is_hanzi(hanzi):
+            continue
+
+        # -------------------------------------------------
+        # Lấy POS.
+        # -------------------------------------------------
+
+        raw_pos = match.group(
+            "pos"
+        )
+
+        pos_values = re.findall(
+            r'"([^"]+)"',
+            raw_pos
+        )
+
+        # -------------------------------------------------
+        # Tìm phần meanings đầy đủ bằng bracket matching.
+        # Không dùng .*? vì meanings có thể chứa object lồng nhau.
+        # -------------------------------------------------
+
+        meanings_start = match.end(
+            "meanings"
+        ) - 1
+
+        meanings_raw = extract_balanced_json(
+            text,
+            meanings_start
+        )
+
+        meanings = []
+
+        if meanings_raw:
+
+            try:
+                meanings = json.loads(
+                    meanings_raw
+                )
+            except Exception:
+                # Thử decode thêm một lớp.
+                try:
+                    meanings = json.loads(
+                        meanings_raw.replace(
+                            '\\"',
+                            '"'
+                        )
+                    )
+                except Exception:
+                    meanings = []
+
+        results.append({
+            "id": item_id,
+            "hanzi": hanzi,
+            "pinyin": pinyin,
+            "partOfSpeech": pos_values,
+            "meanings": meanings
+        })
+
+    # -----------------------------------------------------
+    # Nếu pattern trên không bắt được, dùng pattern ngược:
+    # tìm hanzi trước rồi dò id gần đó.
+    # -----------------------------------------------------
+
+    if not results:
+
+        fallback_pattern = re.compile(
+            r'"hanzi"\s*:\s*"(?P<hanzi>.*?)"'
+            r'.{0,1000}?'
+            r'"pinyin"\s*:\s*"(?P<pinyin>.*?)"'
+            r'.{0,3000}?'
+            r'"partOfSpeech"\s*:\s*\[(?P<pos>.*?)\]',
+            re.DOTALL
+        )
+
+        for match in fallback_pattern.finditer(text):
+
+            hanzi = clean_text(
+                match.group("hanzi")
+            )
+
+            if not is_hanzi(hanzi):
+                continue
+
+            pinyin = clean_text(
+                match.group("pinyin")
+            )
+
+            raw_pos = match.group(
+                "pos"
+            )
+
+            pos_values = re.findall(
+                r'"([^"]+)"',
+                raw_pos
+            )
+
+            results.append({
+                "id": "",
+                "hanzi": hanzi,
+                "pinyin": pinyin,
+                "partOfSpeech": pos_values,
+                "meanings": []
+            })
+
+    return results
+
+
+# =========================================================
+# BALANCED JSON ARRAY
+# =========================================================
+
+def extract_balanced_json(text, start):
+    """
+    start phải trỏ vào '['.
+
+    Tìm đúng dấu ']' tương ứng, có xử lý:
+    - nested []
+    - nested {}
+    - string
+    - escaped quote
+    """
+
+    if (
+        start < 0
+        or start >= len(text)
+        or text[start] != "["
+    ):
+        return None
+
+    square_depth = 0
+    curly_depth = 0
+
+    in_string = False
+    escaped = False
+
+    for i in range(
+        start,
+        len(text)
+    ):
+
+        char = text[i]
+
+        if in_string:
+
+            if escaped:
+                escaped = False
+                continue
+
+            if char == "\\":
+                escaped = True
+                continue
+
+            if char == '"':
+                in_string = False
+
+            continue
+
+        if char == '"':
+            in_string = True
+            continue
+
+        if char == "[":
+            square_depth += 1
+
+        elif char == "]":
+            square_depth -= 1
+
+            if (
+                square_depth == 0
+                and curly_depth == 0
+            ):
+                return text[
+                    start:i + 1
+                ]
+
+        elif char == "{":
+            curly_depth += 1
+
+        elif char == "}":
+            curly_depth -= 1
+
+    return None
+
+
+# =========================================================
+# MEANINGS
+# =========================================================
+
+def parse_meanings(meanings):
+
+    if not isinstance(
+        meanings,
+        list
+    ):
+        return ""
+
+    values = []
+
+    for meaning in meanings:
+
+        if not isinstance(
+            meaning,
+            dict
+        ):
+            continue
+
+        vi = clean_text(
+            meaning.get(
+                "vi",
+                ""
+            )
+        )
+
+        note = clean_text(
+            meaning.get(
+                "note",
+                ""
+            )
+        )
+
+        if vi and note:
+            value = (
+                f"{vi} ({note})"
+            )
+        else:
+            value = vi or note
+
+        if value:
+            values.append(value)
+
+    if not values:
+        return ""
+
+    if len(values) == 1:
+        return values[0]
+
+    return "; ".join(
+        f"{index}. {value}"
+        for index, value in enumerate(
+            values,
+            start=1
         )
     )
 
 
 # =========================================================
-# CHECK HANZI
+# PARSE ONE OBJECT
 # =========================================================
 
-# Hỗ trợ toàn bộ chuỗi Hanzi, không giới hạn 1/2 ký tự.
-# Bao gồm CJK Unified Ideographs và Extension A.
-HANZI_RE = re.compile(r"^[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]+$")
+def parse_vocab_item(item):
 
-
-def is_hanzi(text):
-    if not text:
-        return False
-
-    text = text.strip()
-
-    return bool(HANZI_RE.fullmatch(text))
-
-
-# =========================================================
-# CHECK VOCAB START
-# =========================================================
-
-# HanBeeGo đánh số từ 01, 02,... nhưng không nên phụ thuộc
-# cứng vào đúng 2 chữ số. Hỗ trợ 1-3 chữ số để dùng được
-# cho mọi bài/HSK và không làm mất các từ có Hanzi dài.
-VOCAB_NUMBER_RE = re.compile(r"^\d{1,3}$")
-
-
-def find_pos_index(lines, start_index, max_scan=12):
-    """
-    Tìm vị trí từ loại ngay sau Hanzi + Pinyin.
-
-    Không giả định Pinyin có bao nhiêu âm tiết:
-        bù
-        lǎo
-        shī
-        lǎo shī
-        zài jiàn
-        xué sheng
-    đều được hỗ trợ.
-    """
-
-    end = min(
-        len(lines),
-        start_index + max_scan
-    )
-
-    for i in range(start_index, end):
-        if lines[i].strip() in POS_LIST:
-            return i
-
-    return None
-
-
-def is_vocab_start(lines, index):
-    """
-    Một entry vocabulary hợp lệ phải có:
-
-        STT
-        Hanzi
-        Pinyin (1 hoặc nhiều dòng)
-        Từ loại
-
-    Nhờ kiểm tra cả Từ loại, các số 01/02 xuất hiện
-    trong nội dung khác sẽ không bị nhận nhầm thành từ mới.
-    """
-
-    if index >= len(lines):
-        return False
-
-    if not VOCAB_NUMBER_RE.fullmatch(
-        lines[index].strip()
+    if not isinstance(
+        item,
+        dict
     ):
-        return False
-
-    if index + 1 >= len(lines):
-        return False
-
-    if not is_hanzi(lines[index + 1]):
-        return False
-
-    pos_index = find_pos_index(
-        lines,
-        index + 2
-    )
-
-    return pos_index is not None
-
-
-# =========================================================
-# CLEAN TEXT
-# =========================================================
-
-def clean_text(text):
-    if text is None:
-        return ""
-
-    return re.sub(
-        r"\s+",
-        " ",
-        str(text)
-    ).strip()
-
-
-# =========================================================
-# CLEAN MEANING
-# =========================================================
-
-def clean_meaning(parts):
-    """
-    Giữ nguyên cấu trúc nhiều nghĩa:
-
-        1
-        .
-        nghĩa A
-        2
-        .
-        nghĩa B
-        ghi chú B
-
-    => 1. nghĩa A; 2. nghĩa B ghi chú B
-
-    Nếu không có đánh số:
-        nghĩa chính
-        mô tả
-
-    => nghĩa chính mô tả
-    """
-
-    if not parts:
-        return ""
-
-    groups = []
-    current = []
-    current_number = None
-
-    for raw in parts:
-
-        line = clean_text(raw)
-
-        if not line:
-            continue
-
-        if line == "*":
-            continue
-
-        # Bỏ dấu chấm đứng riêng sau số nghĩa.
-        if line in [".", "．"]:
-            continue
-
-        # Một số nguồn có "1", "2",...
-        # đứng riêng để đánh số các nghĩa.
-        if re.fullmatch(r"\d+", line):
-
-            if current:
-                text = " ".join(current).strip()
-
-                if current_number is not None:
-                    text = f"{current_number}. {text}"
-
-                groups.append(text)
-
-            current = []
-            current_number = line
-
-            continue
-
-        current.append(line)
-
-    # Lưu nhóm cuối.
-    if current:
-
-        text = " ".join(current).strip()
-
-        if current_number is not None:
-            text = f"{current_number}. {text}"
-
-        groups.append(text)
-
-    return "; ".join(
-        group for group in groups if group
-    )
-
-
-# =========================================================
-# PARSE VOCAB BLOCK
-# =========================================================
-
-def parse_vocab_block(block):
-
-    if len(block) < 4:
         return None
 
-    # -----------------------------------------------------
-    # STT
-    # -----------------------------------------------------
+    item_id = clean_text(
+        item.get(
+            "id",
+            ""
+        )
+    )
 
-    stt = block[0].strip()
-
-    if not VOCAB_NUMBER_RE.fullmatch(stt):
+    # Nếu có ID thì phải là vocabulary ID.
+    if item_id and not re.fullmatch(
+        r"v_HSK\d+_\d+",
+        item_id
+    ):
         return None
 
-    # -----------------------------------------------------
-    # HANZI
-    # -----------------------------------------------------
+    hanzi = clean_text(
+        item.get(
+            "hanzi",
+            ""
+        )
+    )
 
-    hanzi = block[1].strip()
+    pinyin = clean_text(
+        item.get(
+            "pinyin",
+            ""
+        )
+    )
+
+    if not hanzi:
+        return None
 
     if not is_hanzi(hanzi):
         return None
 
-    # -----------------------------------------------------
-    # TÌM TỪ LOẠI
-    # -----------------------------------------------------
-
-    pos_index = find_pos_index(
-        block,
-        2
+    # POS
+    raw_pos = item.get(
+        "partOfSpeech",
+        []
     )
 
-    if pos_index is None:
-        return None
+    if not isinstance(
+        raw_pos,
+        list
+    ):
+        raw_pos = [
+            raw_pos
+        ]
 
-    # -----------------------------------------------------
-    # PINYIN
-    #
-    # Lấy toàn bộ nội dung giữa Hanzi và Từ loại.
-    # Không giới hạn số âm tiết.
-    #
-    # Ví dụ:
-    #   bù
-    #   lǎo shī
-    #   zài jiàn
-    #   xué sheng
-    # -----------------------------------------------------
+    pos_values = []
 
-    pinyin_parts = [
-        clean_text(x)
-        for x in block[2:pos_index]
-        if clean_text(x)
-    ]
+    for pos in raw_pos:
 
-    pinyin = " ".join(pinyin_parts)
+        pos = clean_text(
+            pos
+        )
 
-    # -----------------------------------------------------
-    # TỪ LOẠI
-    # -----------------------------------------------------
+        if not pos:
+            continue
 
-    pos = clean_text(
-        block[pos_index]
+        pos = POS_MAP.get(
+            pos,
+            pos
+        )
+
+        if pos not in pos_values:
+            pos_values.append(
+                pos
+            )
+
+    pos = ", ".join(
+        pos_values
     )
 
-    # -----------------------------------------------------
-    # NGHĨA
-    # -----------------------------------------------------
-
-    meaning_lines = []
-
-    for line in block[pos_index + 1:]:
-
-        line = line.strip()
-
-        if line == "Ví dụ":
-            break
-
-        meaning_lines.append(line)
-
-    meaning = clean_meaning(
-        meaning_lines
+    # Meaning
+    meaning = parse_meanings(
+        item.get(
+            "meanings",
+            []
+        )
     )
 
     return {
@@ -360,169 +549,114 @@ def parse_vocab_block(block):
 
 
 # =========================================================
-# FIND VOCABULARY SECTION
+# DEDUPLICATE
 # =========================================================
 
-def find_vocab_start(lines):
-    """
-    Tìm entry vocabulary đầu tiên sau tiêu đề 'Từ vựng'.
+def deduplicate_vocab(data):
 
-    Không phụ thuộc bài có bao nhiêu từ.
-    """
-
-    vocab_headers = {
-        "Từ vựng",
-        "Vocabulary"
-    }
-
-    for i, line in enumerate(lines):
-
-        if line not in vocab_headers:
-            continue
-
-        # Tìm candidate đầu tiên có cấu trúc đầy đủ.
-        for j in range(i + 1, len(lines)):
-
-            if is_vocab_start(lines, j):
-                return j
-
-            # Nếu đã sang phần khác thì dừng.
-            if lines[j] in {
-                "Ngữ pháp",
-                "Grammar",
-                "Hội thoại",
-                "Dialogues",
-                "Bài tập"
-            }:
-                break
-
-    return None
-
-
-# =========================================================
-# SCRAPE VOCAB
-# =========================================================
-
-def scrape_vocab(url):
-
-    soup = get_page(url)
-
-    # -----------------------------------------------------
-    # Lấy text
-    # -----------------------------------------------------
-
-    text = soup.get_text(
-        "\n",
-        strip=True
-    )
-
-    lines = [
-        clean_text(line)
-        for line in text.splitlines()
-        if clean_text(line)
-    ]
-
-    # -----------------------------------------------------
-    # Tìm phần Từ vựng
-    # -----------------------------------------------------
-
-    start = find_vocab_start(lines)
-
-    if start is None:
-        raise Exception(
-            "Không tìm thấy danh sách từ vựng."
-        )
-
-    # -----------------------------------------------------
-    # Tìm tất cả entry vocabulary
-    # -----------------------------------------------------
-
-    vocab_positions = []
-
-    for i in range(start, len(lines)):
-
-        if is_vocab_start(lines, i):
-            vocab_positions.append(i)
-
-    if not vocab_positions:
-        raise Exception(
-            "Không tìm thấy từ vựng hợp lệ."
-        )
-
-    # -----------------------------------------------------
-    # Tạo block
-    # -----------------------------------------------------
-
-    blocks = []
-
-    for index, position in enumerate(vocab_positions):
-
-        if index + 1 < len(vocab_positions):
-
-            end = vocab_positions[index + 1]
-
-        else:
-
-            end = len(lines)
-
-            # Dừng trước phần tiếp theo.
-            section_headers = {
-                "Ngữ pháp",
-                "Grammar",
-                "Hội thoại",
-                "Dialogues",
-                "Bài tập",
-                "Exercises"
-            }
-
-            for j in range(position, len(lines)):
-
-                if lines[j] in section_headers:
-                    end = j
-                    break
-
-        block = lines[position:end]
-
-        blocks.append(block)
-
-    # -----------------------------------------------------
-    # Parse từng block
-    # -----------------------------------------------------
-
-    results = []
-
-    for block in blocks:
-
-        item = parse_vocab_block(block)
-
-        if item:
-            results.append(item)
-
-    # -----------------------------------------------------
-    # Chống duplicate trong lần cào
-    # -----------------------------------------------------
-
-    unique = []
+    result = []
     seen = set()
 
-    for item in results:
+    for item in data:
+
+        if not item:
+            continue
+
+        hanzi = clean_text(
+            item.get(
+                "Hanzi",
+                ""
+            )
+        )
+
+        pinyin = clean_text(
+            item.get(
+                "Pinyin",
+                ""
+            )
+        )
+
+        if not hanzi:
+            continue
 
         key = (
-            item["Hanzi"].strip(),
-            item["Pinyin"].strip()
+            hanzi,
+            pinyin.casefold()
         )
 
         if key in seen:
             continue
 
         seen.add(key)
-        unique.append(item)
 
-    return unique
+        result.append({
+            "Hanzi": hanzi,
+            "Pinyin": pinyin,
+            "Từ loại": clean_text(
+                item.get(
+                    "Từ loại",
+                    ""
+                )
+            ),
+            "Nghĩa": clean_text(
+                item.get(
+                    "Nghĩa",
+                    ""
+                )
+            )
+        })
+
+    return result
 
 
 # =========================================================
-# LOAD EXISTING EXCEL
+# SCRAPE
+# =========================================================
+
+def scrape_vocab(url):
+
+    html = get_page(url)
+
+    raw_objects = extract_vocab_objects(
+        html
+    )
+
+    if not raw_objects:
+
+        raise Exception(
+            "Không tìm thấy dữ liệu vocabulary "
+            "trong Next.js embedded JSON."
+        )
+
+    results = []
+
+    for item in raw_objects:
+
+        parsed = parse_vocab_item(
+            item
+        )
+
+        if parsed:
+            results.append(
+                parsed
+            )
+
+    results = deduplicate_vocab(
+        results
+    )
+
+    if not results:
+
+        raise Exception(
+            "Đã tìm thấy embedded data nhưng "
+            "không có vocabulary hợp lệ."
+        )
+
+    return results
+
+
+# =========================================================
+# EXCEL
 # =========================================================
 
 def load_existing():
@@ -530,7 +664,6 @@ def load_existing():
     if not os.path.exists(
         OUTPUT_FILE
     ):
-
         return pd.DataFrame(
             columns=[
                 "STT",
@@ -560,10 +693,6 @@ def load_existing():
         )
 
 
-# =========================================================
-# SAVE EXCEL
-# =========================================================
-
 def save_excel(
     old_df,
     new_data
@@ -578,10 +707,6 @@ def save_excel(
             "Nghĩa"
         ]
     )
-
-    # -----------------------------------------------------
-    # Gộp dữ liệu cũ và mới
-    # -----------------------------------------------------
 
     if not old_df.empty:
 
@@ -604,56 +729,30 @@ def save_excel(
 
         combined = new_df.copy()
 
-    # -----------------------------------------------------
-    # Đảm bảo đủ cột
-    # -----------------------------------------------------
-
-    for column in [
+    required = [
         "Hanzi",
         "Pinyin",
         "Từ loại",
         "Nghĩa"
-    ]:
+    ]
+
+    for column in required:
 
         if column not in combined.columns:
-
             combined[column] = ""
 
-    # -----------------------------------------------------
-    # Chuẩn hóa text
-    # -----------------------------------------------------
+    combined = combined[
+        required
+    ]
 
-    combined["Hanzi"] = (
-        combined["Hanzi"]
-        .fillna("")
-        .astype(str)
-        .str.strip()
-    )
+    for column in required:
 
-    combined["Pinyin"] = (
-        combined["Pinyin"]
-        .fillna("")
-        .astype(str)
-        .str.strip()
-    )
-
-    combined["Từ loại"] = (
-        combined["Từ loại"]
-        .fillna("")
-        .astype(str)
-        .str.strip()
-    )
-
-    combined["Nghĩa"] = (
-        combined["Nghĩa"]
-        .fillna("")
-        .astype(str)
-        .str.strip()
-    )
-
-    # -----------------------------------------------------
-    # Chống duplicate
-    # -----------------------------------------------------
+        combined[column] = (
+            combined[column]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+        )
 
     combined = combined.drop_duplicates(
         subset=[
@@ -661,11 +760,9 @@ def save_excel(
             "Pinyin"
         ],
         keep="first"
+    ).reset_index(
+        drop=True
     )
-
-    # -----------------------------------------------------
-    # STT
-    # -----------------------------------------------------
 
     combined.insert(
         0,
@@ -676,10 +773,6 @@ def save_excel(
         )
     )
 
-    # -----------------------------------------------------
-    # Đúng thứ tự cột
-    # -----------------------------------------------------
-
     combined = combined[
         [
             "STT",
@@ -689,10 +782,6 @@ def save_excel(
             "Nghĩa"
         ]
     ]
-
-    # -----------------------------------------------------
-    # Ghi Excel
-    # -----------------------------------------------------
 
     combined.to_excel(
         OUTPUT_FILE,
